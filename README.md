@@ -1,11 +1,11 @@
-# deb-renameuser
+# deb-manuser
 
 **All-in-one Debian user manager** — create, delete, rename users, manage sudo, and fix path permissions — all through a whiptail interactive UI.
 
 ## Quick Start
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/sosramalex/deb-renameuser/main/renameuser.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/sosramalex/deb-manuser/main/renameuser.sh)
 ```
 
 ## Features

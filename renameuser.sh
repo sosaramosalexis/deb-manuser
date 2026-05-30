@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BTITLE="Debian User Manager"
-SCRIPT_REPO="sosramalex/deb-renameuser"
+SCRIPT_REPO="sosramalex/deb-manuser"
 
 cleanup() { rm -f /tmp/usermgr_*.txt 2>/dev/null || true; }
 trap cleanup EXIT

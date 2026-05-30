@@ -1,192 +1,189 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+BTITLE="Debian User Manager"
 SCRIPT_REPO="sosramalex/deb-renameuser"
-BTITLE="Debian Username Changer"
 
-cleanup() {
-    rm -f /tmp/renameuser_*.txt 2>/dev/null || true
-}
+cleanup() { rm -f /tmp/usermgr_*.txt 2>/dev/null || true; }
 trap cleanup EXIT
 
-die() {
-    whiptail --title "Error" --msgbox "$1" 8 50
-    exit 1
-}
+die()     { whiptail --title "Error"   --msgbox "$1" 8 50; exit 1; }
+info()    { whiptail --title "Info"    --msgbox "$1" 8 50; }
+confirm() { whiptail --title "Confirm" --yesno "$1" 10 60; }
 
-ok() {
-    whiptail --title "Info" --msgbox "$1" 8 50
-}
+must_root()   { [[ $EUID -eq 0 ]] || die "This must be run as root (sudo)."; }
+need_whiptail() { command -v whiptail &>/dev/null || { echo "whiptail required: apt install whiptail"; exit 1; }; }
 
-# --- Must be root ---
-[[ $EUID -ne 0 ]] && die "This script must be run as root (sudo)."
-command -v whiptail &>/dev/null || { echo "whiptail required: apt install whiptail"; exit 1; }
+pick_user() {
+    local prompt="$1" title="${2:-Select User}"
+    local entries=()
+    while IFS=: read -r name _ uid _ _ home shell; do
+        [[ $uid -ge 1000 && "$name" != "nobody" ]] || continue
+        local desc="UID $uid | $home | $shell"
+        entries+=("$name" "$desc")
+    done < /etc/passwd
+    entries+=("__OTHER__" "Type a username manually")
 
-# --- Welcome ---
-whiptail --title "$BTITLE" --msgbox "\
-This tool will rename a user account on your Debian system.
-
-What it does:
-  • Changes the login name
-  • Renames the matching group
-  • Moves the home directory
-  • Updates file ownerships
-  • Preserves UID/GID so permissions stay intact" 14 56 || exit 1
-
-# --- Build user list (UID >= 1000, non-system) ---
-USER_ENTRIES=()
-USER_NAMES=()
-while IFS=: read -r name _ uid _ _ _ _; do
-    if [[ $uid -ge 1000 ]]; then
-        USER_NAMES+=("$name")
-    fi
-done < /etc/passwd
-
-if [[ ${#USER_NAMES[@]} -gt 0 ]]; then
-    for u in "${USER_NAMES[@]}"; do
-        desc="$(id -u "$u") | $(getent passwd "$u" | cut -d: -f5 | head -c 40)"
-        [[ -z "$desc" ]] && desc="UID $(id -u "$u")"
-        USER_ENTRIES+=("$u" "$desc")
+    while true; do
+        local choice
+        choice=$(whiptail --title "$title" --menu "$prompt" 20 70 10 \
+            "${entries[@]}" 3>&1 1>&2 2>&3) || return 1
+        if [[ "$choice" == "__OTHER__" ]]; then
+            choice=$(whiptail --title "$title" --inputbox "Enter username:" 8 56 "" 3>&1 1>&2 2>&3) || continue
+        fi
+        [[ -z "$choice" ]] && { info "Username cannot be empty."; continue; }
+        echo "$choice"
+        return 0
     done
-fi
-USER_ENTRIES+=("__OTHER__" "Type a username manually")
+}
 
-# --- Get current username ---
-CURRENT=""
-while true; do
-    choice=$(whiptail --title "$BTITLE" --menu "\
-Select the user to rename, or choose 'Type manually':" 20 60 10 \
-        "${USER_ENTRIES[@]}" 3>&1 1>&2 2>&3) || exit 1
+valid_user() {
+    local name="$1"
+    echo "$name" | grep -qE '^[a-z_][a-z0-9_-]*$'
+}
 
-    if [[ "$choice" == "__OTHER__" ]]; then
-        CURRENT=$(whiptail --title "$BTITLE" --inputbox "\
-Enter the CURRENT username to rename:" 8 56 "" 3>&1 1>&2 2>&3) || exit 1
-    else
-        CURRENT="$choice"
+user_exists() { id "$1" &>/dev/null; }
+
+require_user() {
+    local name="$1"
+    user_exists "$name" || die "User '$name' does not exist."
+}
+
+require_no_user() {
+    local name="$1"
+    user_exists "$name" && die "User '$name' already exists."
+}
+
+# ===== CREATE USER =====
+cmd_create() {
+    must_root
+    local username="" fullname="" shell="/bin/bash" groups=""
+    local create_home=true
+
+    while true; do
+        username=$(whiptail --title "$BTITLE — Create User" \
+            --inputbox "Enter new username:" 8 56 "" 3>&1 1>&2 2>&3) || return
+        [[ -z "$username" ]] && { info "Username cannot be empty."; continue; }
+        valid_user "$username" || { info "Invalid username. Use [a-z_][a-z0-9_-]*"; continue; }
+        require_no_user "$username"
+        break
+    done
+
+    fullname=$(whiptail --title "$BTITLE — Create User" \
+        --inputbox "Full name (optional):" 8 56 "" 3>&1 1>&2 2>&3) || fullname=""
+
+    local shells=()
+    while IFS= read -r s; do
+        [[ -x "$s" ]] && shells+=("$s" "")
+    done < /etc/shells 2>/dev/null
+    [[ ${#shells[@]} -eq 0 ]] && shells=("/bin/bash" "" "/bin/sh" "")
+    shell=$(whiptail --title "Shell" --menu "Select shell:" 16 50 6 \
+        "${shells[@]}" 3>&1 1>&2 2>&3) || shell="/bin/bash"
+
+    whiptail --title "Home Directory" --yesno "Create home directory (/home/$username)?" 7 50 && create_home=true || create_home=false
+
+    local groups_input=""
+    groups_input=$(whiptail --title "Groups" \
+        --inputbox "Additional groups (comma-separated, e.g. sudo,docker):" 8 60 "" 3>&1 1>&2 2>&3) || groups_input=""
+
+    local pass=""
+    while true; do
+        pass=$(whiptail --title "Password" --passwordbox "Set password:" 8 50 "" 3>&1 1>&2 2>&3) || return
+        [[ ${#pass} -ge 1 ]] && break
+        info "Password cannot be empty."
+    done
+
+    local flags=()
+    $create_home && flags+=("-m") || flags+=("-M")
+    [[ -n "$fullname" ]] && flags+=(-c "$fullname")
+    flags+=(-s "$shell")
+    [[ -n "$groups_input" ]] && flags+=(-G "$(echo "$groups_input" | tr -d ' ')")
+
+    if whiptail --title "Confirm" --yesno "Create user '$username'?\nShell: $shell\nGroups: ${groups_input:-none}\nHome: $([ "$create_home" ] && echo '/home/'$username || echo 'no')" 12 60; then
+        useradd "${flags[@]}" "$username" || die "Failed to create user."
+        echo "$username:$pass" | chpasswd || die "Failed to set password."
+        info "User '$username' created successfully."
     fi
+}
 
-    [[ -z "$CURRENT" ]] && { ok "Username cannot be empty."; continue; }
-    if ! id "$CURRENT" &>/dev/null; then
-        ok "User '$CURRENT' does not exist."
-        continue
-    fi
-    if [[ $(id -u "$CURRENT") -lt 1000 ]]; then
-        whiptail --title "Warning" --yesno "\
-$CURRENT is a system user (UID < 1000).
+# ===== DELETE USER =====
+cmd_delete() {
+    must_root
+    local username
+    username=$(pick_user "Select user to DELETE:" "Delete User") || return
+    require_user "$username"
 
-Renaming system users can break services.
-Proceed anyway?" 10 56 || continue
-    fi
-    break
-done
+    local uid=$(id -u "$username")
+    local home=$(eval echo "~$username")
+    local proc=$(pgrep -u "$username" 2>/dev/null | wc -l)
 
-# --- Check for active sessions ---
-SESSION_COUNT=$(who -u 2>/dev/null | awk -v u="$CURRENT" '$1==u' | wc -l)
-if [[ $SESSION_COUNT -gt 0 ]]; then
-    whiptail --title "Active Sessions" --yesno "\
-⚠️  User '$CURRENT' has $SESSION_COUNT active session(s).
+    local warn=""
+    [[ $proc -gt 0 ]] && warn+="\n⚠️  $proc process(es) still running."
+    [[ -d "$home" && "$home" != "/" ]] && warn+="\n⚠️  Home dir exists: $home"
 
-$(who -u 2>/dev/null | awk -v u="$CURRENT" '$1==u')
+    confirm "Delete user '$username' (UID $uid)?$warn" || return
 
-Renaming a logged-in user can fail or leave processes orphaned.
-It is strongly recommended to log out all sessions first.
+    local remove_home=false
+    whiptail --title "Delete" --yesno "Also remove home directory (/home/$username)?" 7 50 && remove_home=true
 
-Proceed anyway?" 14 60 || exit 1
-fi
+    confirm "FINAL WARNING: This cannot be undone.\nDelete '$username'?" || return
 
-# --- Check running processes ---
-PROC_COUNT=$(pgrep -u "$CURRENT" 2>/dev/null | wc -l)
-if [[ $PROC_COUNT -gt 0 ]]; then
-    whiptail --title "Running Processes" --yesno "\
-⚠️  User '$CURRENT' has $PROC_COUNT process(es) running.
+    local flags=()
+    $remove_home && flags+=("-r")
+    userdel "${flags[@]}" "$username" || die "Failed to delete user."
+    [[ -d "/var/mail/$username" ]] && rm -f "/var/mail/$username" 2>/dev/null || true
 
-These may become orphaned or misowned after the rename.
-Consider stopping them first (e.g. killall -u $CURRENT).
+    info "User '$username' deleted."
+}
 
-Proceed anyway?" 12 60 || exit 1
-fi
+# ===== RENAME USER =====
+cmd_rename() {
+    must_root
+    local CURRENT
+    CURRENT=$(pick_user "Select user to rename:" "Rename User") || return
+    require_user "$CURRENT"
 
-# --- Get new username ---
-NEW=""
-while true; do
-    NEW=$(whiptail --title "$BTITLE" --inputbox "\
-Enter the NEW username for '$CURRENT':" 8 56 "" 3>&1 1>&2 2>&3) || exit 1
-    [[ -z "$NEW" ]] && { ok "Username cannot be empty."; continue; }
-    echo "$NEW" | grep -qE '^[a-z_][a-z0-9_-]*$' || {
-        ok "Username must start with a letter or underscore\nand contain only letters, digits, - and _."
-        continue
-    }
-    id "$NEW" &>/dev/null && { ok "User '$NEW' already exists."; continue; }
-    [[ "$CURRENT" == "$NEW" ]] && { ok "New username is identical to current one."; continue; }
-    break
-done
+    local session=$(who -u 2>/dev/null | awk -v u="$CURRENT" '$1==u' | wc -l)
+    [[ $session -gt 0 ]] && info "User '$CURRENT' has $session active session(s).\nThey should log out first."
 
-# --- Gather info ---
-CURRENT_UID=$(id -u "$CURRENT")
-CURRENT_GID=$(id -g "$CURRENT")
-CURRENT_HOME=$(eval echo "~$CURRENT")
-CURRENT_GROUPS=$(id -nG "$CURRENT")
+    local proc=$(pgrep -u "$CURRENT" 2>/dev/null | wc -l)
+    [[ $proc -gt 0 ]] && info "⚠️  $proc process(es) still running."
 
-# --- Extra options ---
-OPTIONS=$(whiptail --title "$BTITLE" --checklist "\
-Extra options for '$CURRENT' → '$NEW':" 12 60 3 \
-    "MOVE_HOME" "Move /home/$CURRENT → /home/$NEW" ON \
-    "RENAME_GROUP" "Rename group '$CURRENT' → '$NEW'" ON \
-    "UPDATE_MAIL" "Update mail spool if present" ON \
-    3>&1 1>&2 2>&3) || exit 1
+    local NEW=""
+    while true; do
+        NEW=$(whiptail --title "$BTITLE — Rename" \
+            --inputbox "New username for '$CURRENT':" 8 56 "" 3>&1 1>&2 2>&3) || return
+        [[ -z "$NEW" ]] && { info "Cannot be empty."; continue; }
+        valid_user "$NEW" || { info "Invalid username."; continue; }
+        require_no_user "$NEW"
+        [[ "$CURRENT" == "$NEW" ]] && { info "Must be different."; continue; }
+        break
+    done
 
-MOVE_HOME=false; RENAME_GROUP=false; UPDATE_MAIL=false
-[[ "$OPTIONS" == *"MOVE_HOME"* ]] && MOVE_HOME=true
-[[ "$OPTIONS" == *"RENAME_GROUP"* ]] && RENAME_GROUP=true
-[[ "$OPTIONS" == *"UPDATE_MAIL"* ]] && UPDATE_MAIL=true
+    local uid=$(id -u "$CURRENT") gid=$(id -g "$CURRENT")
+    local home=$(eval echo "~$CURRENT") groups=$(id -nG "$CURRENT")
 
-# --- Summary ---
-{
-    echo "Current user:  $CURRENT (UID $CURRENT_UID)"
-    echo "New username:  $NEW"
-    echo "Home:          $CURRENT_HOME"
-    echo "Primary GID:  $CURRENT_GID"
-    echo "Groups:        $CURRENT_GROUPS"
-    echo ""
-    echo "Actions:"
-    echo "  • usermod -l $NEW $CURRENT  (rename login)"
-    $RENAME_GROUP && echo "  • groupmod -n $NEW $CURRENT  (rename group)"
-    $MOVE_HOME && echo "  • usermod -d /home/$NEW -m $NEW  (move home)"
-    echo "  • chown -R $NEW:$NEW /home/$NEW  (fix ownership)"
-    $UPDATE_MAIL && echo "  • mv /var/mail/$CURRENT /var/mail/$NEW  (mail spool)"
-    echo "  • Update supplementary groups"
-} > /tmp/renameuser_confirm.txt
+    local OPTIONS
+    OPTIONS=$(whiptail --title "Options" --checklist "Extra options:" 12 60 3 \
+        "MOVE_HOME" "Move /home/$CURRENT → /home/$NEW" ON \
+        "RENAME_GROUP" "Rename group '$CURRENT' → '$NEW'" ON \
+        "UPDATE_MAIL" "Update mail spool" ON \
+        3>&1 1>&2 2>&3) || return
 
-whiptail --title "Confirm Changes" --textbox /tmp/renameuser_confirm.txt 18 60 \
-    --ok-button "Continue" --cancel-button "Cancel" || exit 1
+    local do_home=false; do_group=false; do_mail=false
+    [[ "$OPTIONS" == *"MOVE_HOME"* ]] && do_home=true
+    [[ "$OPTIONS" == *"RENAME_GROUP"* ]] && do_group=true
+    [[ "$OPTIONS" == *"UPDATE_MAIL"* ]] && do_mail=true
 
-whiptail --title "Confirm" --yesno "\
-⚠️  This will rename '$CURRENT' to '$NEW'.
+    confirm "Rename '$CURRENT' → '$NEW'?" || return
 
-The user must log out for the change to fully take effect.
-After reboot, log in as '$NEW'.
+    # Execute
+    usermod -l "$NEW" "$CURRENT" || die "usermod -l failed."
+    $do_group && getent group "$CURRENT" &>/dev/null && groupmod -n "$NEW" "$CURRENT" 2>/dev/null || true
 
-Are you SURE you want to proceed?" 10 60 || exit 1
-
-# --- Execute ---
-(
-    echo "10"; echo "XXX\nStep 1/5: Changing login name...\nXXX"
-    if ! usermod -l "$NEW" "$CURRENT"; then
-        echo "XXX\nERROR: usermod failed.\nCheck if user has active processes.\nXXX"
-        sleep 3; exit 1
-    fi
-
-    echo "30"; echo "XXX\nStep 2/5: Renaming primary group...\nXXX"
-    if $RENAME_GROUP && getent group "$CURRENT" &>/dev/null; then
-        groupmod -n "$NEW" "$CURRENT" || true
-    fi
-
-    echo "45"; echo "XXX\nStep 3/5: Moving home directory...\nXXX"
-    if $MOVE_HOME; then
+    if $do_home; then
         if [[ -d "/home/$CURRENT" ]]; then
-            usermod -d "/home/$NEW" -m "$NEW" || {
-                echo "XXX\nWARNING: Home dir move failed, trying manual...\nXXX"
-                sleep 1
+            usermod -d "/home/$NEW" -m "$NEW" 2>/dev/null || {
                 mv "/home/$CURRENT" "/home/$NEW" 2>/dev/null || true
                 usermod -d "/home/$NEW" "$NEW" 2>/dev/null || true
             }
@@ -195,63 +192,146 @@ Are you SURE you want to proceed?" 10 60 || exit 1
         fi
     fi
 
-    echo "65"; echo "XXX\nStep 4/5: Fixing file ownership...\nXXX"
-    if [[ -d "/home/$NEW" ]]; then
-        chown -R "$NEW":"$NEW" "/home/$NEW" 2>/dev/null || true
-    fi
-    if $UPDATE_MAIL && [[ -f "/var/mail/$CURRENT" ]]; then
+    [[ -d "/home/$NEW" ]] && chown -R "$NEW":"$NEW" "/home/$NEW" 2>/dev/null || true
+
+    $do_mail && [[ -f "/var/mail/$CURRENT" ]] && {
         mv "/var/mail/$CURRENT" "/var/mail/$NEW" 2>/dev/null || true
         chown "$NEW:mail" "/var/mail/$NEW" 2>/dev/null || true
-    fi
+    }
 
-    echo "85"; echo "XXX\nStep 5/5: Updating supplementary groups...\nXXX"
-    for grp in $CURRENT_GROUPS; do
-        if [[ "$grp" != "$CURRENT" ]] && [[ "$grp" != "$NEW" ]]; then
-            gpasswd -a "$NEW" "$grp" &>/dev/null || true
-        fi
+    for grp in $groups; do
+        [[ "$grp" != "$CURRENT" && "$grp" != "$NEW" ]] && gpasswd -a "$NEW" "$grp" &>/dev/null || true
     done
 
-    echo "100"; echo "XXX\nDone! All steps completed.\nXXX"
-    sleep 1
-) | whiptail --title "$BTITLE" --gauge "\
-Renaming $CURRENT → $NEW ..." 8 56 0
+    info "Rename complete.\n\nOld: $CURRENT\nNew: $NEW\nUID: $uid (unchanged)"
+}
 
-EXITCODE=${PIPESTATUS[0]}
-if [[ $EXITCODE -ne 0 ]]; then
-    die "Rename failed. Check errors above.\nYou may need to revert manually."
-fi
+# ===== SUDO MANAGEMENT =====
+cmd_sudo() {
+    must_root
+    local username
+    username=$(pick_user "Select user:" "Sudo Management") || return
+    require_user "$username"
 
-# --- Final report ---
-NEW_HOME=$(eval echo "~$NEW" 2>/dev/null || echo "/home/$NEW")
-VERIFY=$(id "$NEW" 2>&1)
-{
-    echo "✅ Rename complete!"
-    echo ""
-    echo "Old login:  $CURRENT"
-    echo "New login:  $NEW"
-    echo "UID:        $CURRENT_UID (unchanged)"
-    echo "Home:       $NEW_HOME"
-    echo "Primary GID: $(id -g "$NEW" 2>/dev/null || echo '?')"
-    echo ""
-    echo "Verification:"
-    echo "$VERIFY"
-    echo ""
-    echo "📋 Post-rename checklist:"
-    echo "  • Log out completely, then log in as '$NEW'"
-    echo "  • Update SSH authorized_keys if needed:"
-    echo "    chown -R $NEW:$NEW ~$NEW/.ssh"
-    echo "  • Fix cron/at jobs belonging to old user:"
-    echo "    crontab -u $NEW -l"
-    echo "  • Check for orphaned processes:"
-    echo "    ps -u $CURRENT_UID"
-    echo "  • Update any scripts/services that hardcode '$CURRENT'"
-} > /tmp/renameuser_final.txt
+    local has_sudo=false
+    groups "$username" 2>/dev/null | grep -qw "sudo" && has_sudo=true
 
-whiptail --title "Success" --textbox /tmp/renameuser_final.txt 22 66 --ok-button "Done"
+    if $has_sudo; then
+        if whiptail --title "Sudo" --yesno "User '$username' HAS sudo.\n\nRemove sudo access?" 9 60; then
+            gpasswd -d "$username" sudo &>/dev/null || true
+            info "Sudo removed from '$username'."
+        fi
+    else
+        if whiptail --title "Sudo" --yesno "User '$username' does NOT have sudo.\n\nGrant sudo access?" 9 60; then
+            gpasswd -a "$username" sudo &>/dev/null || true
+            info "Sudo granted to '$username'.\n\nUser must log out and back in."
+        fi
+    fi
+}
 
-whiptail --title "$BTITLE" --yesno "\
-This script is available on GitHub:
+# ===== PATH PERMISSIONS =====
+cmd_perms() {
+    must_root
+    local target
+    local mode=""
 
-  https://github.com/$SCRIPT_REPO
+    mode=$(whiptail --title "$BTITLE — Permissions" --menu "What to manage?" 12 50 3 \
+        "USER" "Fix ownership/permissions for a user's home" \
+        "PATH" "Set permissions on a specific path" \
+        3>&1 1>&2 2>&3) || return
 
-Star it if you found it useful!" 10 56 || true
+    if [[ "$mode" == "USER" ]]; then
+        local username
+        username=$(pick_user "Select user:" "User Permissions") || return
+        require_user "$username"
+        target=$(eval echo "~$username")
+        [[ ! -d "$target" ]] && die "Home dir '$target' does not exist."
+
+        local own=$(whiptail --title "Permissions" --radiolist "Set ownership on $target" 10 60 3 \
+            "USER" "chown -R $username:$username" ON \
+            "ROOT" "chown -R root:root" OFF \
+            "KEEP" "Leave ownership as-is" OFF \
+            3>&1 1>&2 2>&3) || return
+
+        local perm=""
+        perm=$(whiptail --title "Permissions" --menu "Set directory permissions on $target" 12 60 4 \
+            "755" "drwxr-xr-x (default for home)" \
+            "750" "drwxr-x--- (restrict group)" \
+            "700" "drwx------ (private)" \
+            "SKIP" "Leave as-is" \
+            3>&1 1>&2 2>&3) || return
+
+        confirm "Apply to $target?" || return
+
+        [[ "$own" == "USER" ]] && chown -R "$username":"$username" "$target"
+        [[ "$own" == "ROOT" ]] && chown -R root:root "$target"
+        [[ "$perm" != "SKIP" ]] && chmod "$perm" "$target"
+
+        info "Permissions applied to $target."
+    else
+        target=$(whiptail --title "Path" --inputbox "Enter full path:" 8 60 "" 3>&1 1>&2 2>&3) || return
+        [[ ! -e "$target" ]] && die "Path does not exist."
+
+        local username=""
+        username=$(pick_user "Set owner (select user):" "Owner") || username=""
+        local group=""
+        group=$(whiptail --title "Group" --inputbox "Group (or leave blank):" 8 50 "" 3>&1 1>&2 2>&3) || group=""
+
+        local perm=""
+        perm=$(whiptail --title "Mode" --menu "Permission mode:" 12 50 4 \
+            "755" "drwxr-xr-x" \
+            "750" "drwxr-x---" \
+            "700" "drwx------" \
+            "SKIP" "Leave as-is" \
+            3>&1 1>&2 2>&3) || return
+
+        local recursive=false
+        whiptail --title "Recursive" --yesno "Apply recursively?" 7 40 && recursive=true
+
+        confirm "Apply to $target?" || return
+
+        [[ -n "$username" && -n "$group" ]] && chown "$username":"$group" "$target"
+        [[ -n "$username" && -z "$group" ]] && chown "$username" "$target"
+        [[ -z "$username" && -n "$group" ]] && chgrp "$group" "$target"
+        [[ "$perm" != "SKIP" ]] && chmod "$perm" "$target"
+        $recursive && {
+            [[ -n "$username" && -n "$group" ]] && chown -R "$username":"$group" "$target"
+            [[ -n "$username" && -z "$group" ]] && chown -R "$username" "$target"
+            [[ -z "$username" && -n "$group" ]] && chgrp -R "$group" "$target"
+            [[ "$perm" != "SKIP" ]] && find "$target" -type d -exec chmod "$perm" {} +
+        }
+
+        info "Permissions applied to $target."
+    fi
+}
+
+# ===== MAIN =====
+need_whiptail
+must_root
+
+while true; do
+    choice=$(whiptail --title "$BTITLE" --menu "\
+Manage users, permissions, and sudo access." 18 60 6 \
+        "1" "Create user" \
+        "2" "Delete user" \
+        "3" "Rename user" \
+        "4" "Manage sudo (grant/remove)" \
+        "5" "Manage path permissions" \
+        "Q" "Quit" \
+        3>&1 1>&2 2>&3) || break
+
+    case "$choice" in
+        1) cmd_create ;;
+        2) cmd_delete ;;
+        3) cmd_rename ;;
+        4) cmd_sudo ;;
+        5) cmd_perms ;;
+        Q) break ;;
+    esac
+
+    if [[ -t 0 ]]; then
+        whiptail --title "Done" --msgbox "Press OK to return to menu." 6 30 2>/dev/null || true
+    fi
+done
+
+cleanup

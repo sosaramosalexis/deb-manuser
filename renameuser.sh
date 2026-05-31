@@ -59,6 +59,76 @@ require_no_user() {
     return 1
 }
 
+# ─── SHELL CONFIG ───────────────────────────────────────
+setup_user_shell_config() {
+    local user="$1"
+    local home
+    home=$(eval echo "~$user" 2>/dev/null)
+    [[ -z "$home" || "$home" == "/" ]] && { log "Invalid home for $user"; return 1; }
+
+    # Ensure home directory exists and is owned by user
+    mkdir -p "$home"
+    chown "$user:$user" "$home"
+    chmod 755 "$home"
+
+    # Create .bashrc
+    if [[ ! -f "$home/.bashrc" ]]; then
+        cat > "$home/.bashrc" <<- 'SHELLEOF'
+			[ -z "$PS1" ] && return
+			HISTCONTROL=ignoreboth
+			shopt -s histappend
+			HISTSIZE=1000
+			HISTFILESIZE=2000
+			PS1='[\u@\h \W]\$ '
+			if [ -x /usr/bin/dircolors ]; then
+			    eval "$(dircolors -b)"
+			fi
+			alias ls='ls --color=auto'
+			alias ll='ls -alF'
+			alias la='ls -A'
+			alias l='ls -CF'
+			if ! shopt -oq posix; then
+			    if [ -f /usr/share/bash-completion/bash_completion ]; then
+			        . /usr/share/bash-completion/bash_completion
+			    elif [ -f /etc/bash_completion ]; then
+			        . /etc/bash_completion
+			    fi
+			fi
+		SHELLEOF
+        chown "$user:$user" "$home/.bashrc"
+        log ".bashrc created for $user"
+    fi
+
+    # Create .profile
+    if [[ ! -f "$home/.profile" ]]; then
+        cat > "$home/.profile" <<- 'SHELLEOF'
+			if [ -n "$BASH_VERSION" ]; then
+			    if [ -f "$HOME/.bashrc" ]; then
+			        . "$HOME/.bashrc"
+			    fi
+			fi
+		SHELLEOF
+        chown "$user:$user" "$home/.profile"
+        log ".profile created for $user"
+    fi
+
+    # Switch to bash if shell is /bin/sh
+    current_shell=$(getent passwd "$user" | cut -d: -f7)
+    if [[ "$current_shell" == "/bin/sh" || "$current_shell" == "/bin/dash" ]]; then
+        chsh -s /bin/bash "$user" &>/dev/null && log "Shell changed to /bin/bash for $user"
+    fi
+}
+
+cmd_fixshell() {
+    must_root
+    local username
+    username=$(pick_user "Select user to fix shell config:" "Fix Shell Config") || return
+    require_user "$username"
+    setup_user_shell_config "$username" && \
+        info "Shell config set up for '$username'.\nPrompt: [user@host dir]$ " || \
+        die "Failed to fix shell config for '$username'."
+}
+
 # ─── CREATE USER ────────────────────────────────────────
 cmd_create() {
     must_root
@@ -105,6 +175,11 @@ cmd_create() {
     useradd "${flags[@]}" "$username" || die "useradd failed."
     echo "$username:$pass" | chpasswd || die "chpasswd failed."
     log "User $username created"
+
+    # Set up shell config files
+    setup_user_shell_config "$username"
+    log "Shell config set up for $username"
+
     info "User '$username' created."
 }
 
@@ -351,12 +426,13 @@ log "=== Session started ==="
 
 while true; do
     choice=$(whiptail --title "$BTITLE" --menu "\
-Manage users, permissions, and sudo access." 18 60 6 \
+Manage users, permissions, and sudo access." 18 60 7 \
         "1" "Create user" \
         "2" "Delete user" \
         "3" "Rename user" \
         "4" "Manage sudo" \
         "5" "Path permissions" \
+        "6" "Fix shell config" \
         "Q" "Quit" \
         3>&1 1>&2 2>&3) || break
 
@@ -366,6 +442,7 @@ Manage users, permissions, and sudo access." 18 60 6 \
         3) cmd_rename  ;;
         4) cmd_sudo    ;;
         5) cmd_perms   ;;
+        6) cmd_fixshell ;;
         Q) log "User quit"; break ;;
     esac
 

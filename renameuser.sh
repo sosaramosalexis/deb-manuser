@@ -418,6 +418,39 @@ cmd_perms() {
     fi
 }
 
+# ─── KILL PROCESSES ────────────────────────────────────
+cmd_killprocs() {
+    must_root
+    local username
+    username=$(pick_user "Select user to kill all processes:" "Kill Processes") || return
+    require_user "$username"
+
+    local procs
+    procs=$(pgrep -u "$username" 2>/dev/null || true)
+    local count
+    count=$(echo "$procs" | grep -c . 2>/dev/null || echo 0)
+    [[ "$count" -eq 0 ]] && { info "No processes running for '$username'."; return; }
+
+    local psinfo
+    psinfo=$(ps -u "$username" -o pid,comm --no-headers 2>/dev/null | head -30)
+    confirm "Kill $count process(es) for '$username'?\n\n$psinfo" || return
+
+    log "Killing $count processes for $username"
+    pkill -KILL -u "$username" 2>/dev/null || killall -9 -u "$username" 2>/dev/null || \
+        kill -9 $procs 2>/dev/null || true
+
+    sleep 1
+    local remaining
+    remaining=$(pgrep -u "$username" 2>/dev/null | wc -l)
+    if [[ "$remaining" -eq 0 ]]; then
+        info "All processes killed for '$username'."
+        log "All processes killed for $username"
+    else
+        info "$remaining process(es) still running for '$username'.\nTry again or use SIGKILL manually."
+        log "$remaining processes remaining for $username after kill attempt"
+    fi
+}
+
 # ═══════════════════ MAIN ═══════════════════════════════
 need_whiptail
 must_root
@@ -433,6 +466,7 @@ Manage users, permissions, and sudo access." 18 60 7 \
         "4" "Manage sudo" \
         "5" "Path permissions" \
         "6" "Fix shell config" \
+        "7" "Kill user processes" \
         "Q" "Quit" \
         3>&1 1>&2 2>&3) || break
 
@@ -443,6 +477,7 @@ Manage users, permissions, and sudo access." 18 60 7 \
         4) cmd_sudo    ;;
         5) cmd_perms   ;;
         6) cmd_fixshell ;;
+        7) cmd_killprocs ;;
         Q) log "User quit"; break ;;
     esac
 

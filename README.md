@@ -9,7 +9,7 @@
 ## Quick Start
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/sosramalex/deb-manuser/main/renameuser.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/sosaramosalexis/deb-manuser/main/renameuser.sh)
 ```
 
 ## Features

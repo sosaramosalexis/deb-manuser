@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/shell-blue?logo=bash&style=flat-square" alt="Shell">
+</p>
+
 # deb-manuser
 
 **All-in-one Debian user manager** — create, delete, rename users, manage sudo, and fix path permissions — all through a whiptail interactive UI.
